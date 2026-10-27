@@ -1,0 +1,40 @@
+{
+  "sprint": 1,
+  "features": [
+    {
+      "id": "HU01",
+      "title": "Registrar solicitante",
+      "status": "completed"
+    },
+    {
+      "id": "HU02",
+      "title": "Consultar información del solicitante",
+      "status": "completed"
+    },
+    {
+      "id": "HU03",
+      "title": "Crear variable de riesgo",
+      "status": "completed"
+    },
+    {
+      "id": "HU04",
+      "title": "Gestionar estado de variable de riesgo",
+      "status": "completed"
+    },
+    {
+      "id": "HU05",
+      "title": "Crear regla de scoring",
+      "status": "completed"
+    },
+    {
+      "id": "HU06",
+      "title": "Editar regla de scoring",
+      "status": "completed"
+    },
+    {
+      "id": "HU07",
+      "title": "Calcular score crediticio",
+      "status": "completed"
+    }
+  ]
+}

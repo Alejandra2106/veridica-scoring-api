@@ -1,0 +1,434 @@
+package com.crediticio.scoring.infrastructure.input;
+
+import com.crediticio.config.JwtConfig;
+import com.crediticio.config.SecurityConfig;
+import com.crediticio.scoring.application.dto.CrearReglaScoringRequest;
+import com.crediticio.scoring.application.dto.EditarReglaScoringRequest;
+import com.crediticio.scoring.application.dto.ReglaScoringResponse;
+import com.crediticio.scoring.domain.OperadorScoring;
+import com.crediticio.scoring.domain.ReglaScoringDuplicadaException;
+import com.crediticio.scoring.domain.ReglaScoringNoEncontradaException;
+import com.crediticio.scoring.domain.ReglaScoringVariableInactivaException;
+import com.crediticio.scoring.domain.ReglaScoringVariableNoEncontradaException;
+import com.crediticio.scoring.ports.input.CrearReglaScoringUseCase;
+import com.crediticio.scoring.ports.input.EditarReglaScoringUseCase;
+import com.crediticio.shared.exception.GlobalExceptionHandler;
+import com.crediticio.shared.util.TraceIdFilter;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
+import org.springframework.context.annotation.Import;
+import org.springframework.http.MediaType;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.test.web.servlet.request.RequestPostProcessor;
+
+import java.util.List;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mockingDetails;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+@WebMvcTest(ReglaScoringController.class)
+@Import({GlobalExceptionHandler.class, TraceIdFilter.class, SecurityConfig.class})
+class ReglaScoringControllerTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    /** HU10: la cadena de seguridad real exige un JWT; aquí se simula el token ya validado con su rol. */
+    @MockitoBean
+    private JwtDecoder jwtDecoder;
+
+    private static RequestPostProcessor conRol(String rol) {
+        return jwt().jwt(token -> token.subject(UUID.randomUUID().toString()).claim(JwtConfig.CLAIM_ROL, rol))
+                .authorities(new SimpleGrantedAuthority("ROLE_" + rol));
+    }
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @MockitoBean
+    private CrearReglaScoringUseCase crearReglaScoringUseCase;
+
+    @MockitoBean
+    private EditarReglaScoringUseCase editarReglaScoringUseCase;
+
+    @Test
+    void debeRetornar201YExactamenteLosCincoCamposAprobadosCuandoLaCreacionEsExitosa() throws Exception {
+        CrearReglaScoringRequest request = solicitudValida();
+        ReglaScoringResponse response = new ReglaScoringResponse(1L, 1L, OperadorScoring.MAYOR_O_IGUAL, "3000000", 20);
+        when(crearReglaScoringUseCase.crear(any(CrearReglaScoringRequest.class))).thenReturn(response);
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isCreated())
+                .andExpect(header().exists("X-Trace-Id"))
+                .andExpect(jsonPath("$.idRegla").value(1))
+                .andExpect(jsonPath("$.idRiesgo").value(1))
+                .andExpect(jsonPath("$.operador").value(">="))
+                .andExpect(jsonPath("$.valorCondicion").value("3000000"))
+                .andExpect(jsonPath("$.puntaje").value(20));
+    }
+
+    @Test
+    void debeRetornar400CuandoFaltaElIdRiesgo() throws Exception {
+        String payloadSinIdRiesgo = """
+                {
+                  "operador": ">=",
+                  "valorCondicion": "3000000",
+                  "puntaje": 20
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payloadSinIdRiesgo))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.stackTrace").doesNotExist());
+    }
+
+    @Test
+    void debeRetornar400CuandoElOperadorNoPerteneceAlConjuntoPermitido() throws Exception {
+        String payloadConOperadorInvalido = """
+                {
+                  "idRiesgo": 1,
+                  "operador": "!=",
+                  "valorCondicion": "3000000",
+                  "puntaje": 20
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payloadConOperadorInvalido))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    void debeRetornar400CuandoElPuntajeExcedeElRangoPermitido() throws Exception {
+        String payloadConPuntajeFueraDeRango = """
+                {
+                  "idRiesgo": 1,
+                  "operador": ">=",
+                  "valorCondicion": "3000000",
+                  "puntaje": 101
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payloadConPuntajeFueraDeRango))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    void debeRetornar400YNoLlegarAlCasoDeUsoCuandoElPuntajeEsElDecimalReportado() throws Exception {
+        // Reproduce exactamente el defecto reportado: Jackson truncaba "puntaje": 20.5 a 20
+        // en vez de rechazarlo (RF09 exige un entero estricto, sin truncar ni redondear).
+        String payloadConPuntajeDecimalReportado = """
+                {
+                  "idRiesgo": 109,
+                  "operador": ">=",
+                  "valorCondicion": "600000",
+                  "puntaje": 20.5
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payloadConPuntajeDecimalReportado))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.stackTrace").doesNotExist());
+
+        verify(crearReglaScoringUseCase, never()).crear(any(CrearReglaScoringRequest.class));
+    }
+
+    @Test
+    void debeRetornar400YNoLlegarAlCasoDeUsoCuandoElIdRiesgoEsDecimal() throws Exception {
+        String payloadConIdRiesgoDecimal = """
+                {
+                  "idRiesgo": 3.7,
+                  "operador": ">=",
+                  "valorCondicion": "3000000",
+                  "puntaje": 20
+                }
+                """;
+
+        MvcResult resultado = mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payloadConIdRiesgoDecimal))
+                .andReturn();
+
+        List<Long> idRiesgoRecibido = mockingDetails(crearReglaScoringUseCase).getInvocations().stream()
+                .map(invocacion -> ((CrearReglaScoringRequest) invocacion.getArgument(0)).getIdRiesgo())
+                .toList();
+        assertThat(resultado.getResponse().getStatus())
+                .as("estado HTTP; idRiesgo recibido por el caso de uso: %s", idRiesgoRecibido)
+                .isEqualTo(400);
+        assertThat(idRiesgoRecibido).as("idRiesgo recibido por el caso de uso").isEmpty();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"20.0", "-20.5"})
+    void debeRetornar400YNoLlegarAlCasoDeUsoCuandoElPuntajeTieneNotacionDecimal(String puntajeConDecimal) throws Exception {
+        String payload = """
+                {
+                  "idRiesgo": 1,
+                  "operador": ">=",
+                  "valorCondicion": "3000000",
+                  "puntaje": %s
+                }
+                """.formatted(puntajeConDecimal);
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+
+        verify(crearReglaScoringUseCase, never()).crear(any(CrearReglaScoringRequest.class));
+    }
+
+    @Test
+    void debeRetornar400CuandoElPuntajeNoEsNumerico() throws Exception {
+        String payloadConPuntajeNoNumerico = """
+                {
+                  "idRiesgo": 1,
+                  "operador": ">=",
+                  "valorCondicion": "3000000",
+                  "puntaje": "abc"
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payloadConPuntajeNoNumerico))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+
+        verify(crearReglaScoringUseCase, never()).crear(any(CrearReglaScoringRequest.class));
+    }
+
+    @Test
+    void debeRetornar400CuandoElPuntajeEsMenorAMenos100() throws Exception {
+        String payloadConPuntajeFueraDeRango = """
+                {
+                  "idRiesgo": 1,
+                  "operador": ">=",
+                  "valorCondicion": "3000000",
+                  "puntaje": -101
+                }
+                """;
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payloadConPuntajeFueraDeRango))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {-100, 100})
+    void debeAceptarPuntajeEnteroEnLosLimitesDelRango(int puntajeValido) throws Exception {
+        ReglaScoringResponse response = new ReglaScoringResponse(1L, 1L, OperadorScoring.MAYOR_O_IGUAL, "3000000",
+                puntajeValido);
+        when(crearReglaScoringUseCase.crear(any(CrearReglaScoringRequest.class))).thenReturn(response);
+
+        String payload = """
+                {
+                  "idRiesgo": 1,
+                  "operador": ">=",
+                  "valorCondicion": "3000000",
+                  "puntaje": %d
+                }
+                """.formatted(puntajeValido);
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payload))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.puntaje").value(puntajeValido));
+    }
+
+    @Test
+    void debeRetornar404CuandoLaVariableDeRiesgoNoExiste() throws Exception {
+        when(crearReglaScoringUseCase.crear(any(CrearReglaScoringRequest.class)))
+                .thenThrow(new ReglaScoringVariableNoEncontradaException());
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(solicitudValida())))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.errorCode").value("VARIABLE_RIESGO_NO_ENCONTRADA"))
+                .andExpect(jsonPath("$.stackTrace").doesNotExist());
+    }
+
+    @Test
+    void debeRetornar409CuandoLaVariableDeRiesgoEstaInactiva() throws Exception {
+        when(crearReglaScoringUseCase.crear(any(CrearReglaScoringRequest.class)))
+                .thenThrow(new ReglaScoringVariableInactivaException());
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(solicitudValida())))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("VARIABLE_RIESGO_INACTIVA"))
+                .andExpect(jsonPath("$.stackTrace").doesNotExist());
+    }
+
+    @Test
+    void debeRetornar409CuandoLaReglaEstaDuplicada() throws Exception {
+        when(crearReglaScoringUseCase.crear(any(CrearReglaScoringRequest.class)))
+                .thenThrow(new ReglaScoringDuplicadaException());
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(solicitudValida())))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("REGLA_SCORING_DUPLICADA"))
+                .andExpect(jsonPath("$.stackTrace").doesNotExist());
+    }
+
+    @Test
+    void debeRetornar500SinExponerDetallesInternosAnteUnErrorNoControlado() throws Exception {
+        when(crearReglaScoringUseCase.crear(any(CrearReglaScoringRequest.class)))
+                .thenThrow(new RuntimeException("fallo inesperado de infraestructura"));
+
+        mockMvc.perform(post("/api/v1/reglas-scoring").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(solicitudValida())))
+                .andExpect(status().isInternalServerError())
+                .andExpect(jsonPath("$.errorCode").value("INTERNAL_ERROR"))
+                .andExpect(jsonPath("$.stackTrace").doesNotExist());
+    }
+
+    @Test
+    void debeRetornar200ConLosCincoCamposActualizadosCuandoLaEdicionEsExitosa() throws Exception {
+        EditarReglaScoringRequest request = solicitudEdicionValida();
+        ReglaScoringResponse response = new ReglaScoringResponse(7L, 1L, OperadorScoring.MENOR, "5000000", 25);
+        when(editarReglaScoringUseCase.editar(eq(7L), any(EditarReglaScoringRequest.class))).thenReturn(response);
+
+        mockMvc.perform(patch("/api/v1/reglas-scoring/7").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(request)))
+                .andExpect(status().isOk())
+                .andExpect(header().exists("X-Trace-Id"))
+                .andExpect(jsonPath("$.idRegla").value(7))
+                .andExpect(jsonPath("$.idRiesgo").value(1))
+                .andExpect(jsonPath("$.operador").value("<"))
+                .andExpect(jsonPath("$.valorCondicion").value("5000000"))
+                .andExpect(jsonPath("$.puntaje").value(25));
+    }
+
+    @Test
+    void debeRetornar400CuandoFaltaElOperadorAlEditar() throws Exception {
+        String payloadSinOperador = """
+                {
+                  "valorCondicion": "5000000",
+                  "puntaje": 25
+                }
+                """;
+
+        mockMvc.perform(patch("/api/v1/reglas-scoring/7").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payloadSinOperador))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"))
+                .andExpect(jsonPath("$.stackTrace").doesNotExist());
+    }
+
+    @Test
+    void debeRetornar400CuandoElPuntajeAlEditarTieneNotacionDecimal() throws Exception {
+        String payloadConPuntajeDecimal = """
+                {
+                  "operador": ">=",
+                  "valorCondicion": "5000000",
+                  "puntaje": 20.5
+                }
+                """;
+
+        mockMvc.perform(patch("/api/v1/reglas-scoring/7").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(payloadConPuntajeDecimal))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+
+        verify(editarReglaScoringUseCase, never()).editar(any(Long.class), any(EditarReglaScoringRequest.class));
+    }
+
+    @Test
+    void debeRetornar404CuandoLaReglaDeScoringNoExiste() throws Exception {
+        when(editarReglaScoringUseCase.editar(eq(999L), any(EditarReglaScoringRequest.class)))
+                .thenThrow(new ReglaScoringNoEncontradaException());
+
+        mockMvc.perform(patch("/api/v1/reglas-scoring/999").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(solicitudEdicionValida())))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.errorCode").value("REGLA_SCORING_NO_ENCONTRADA"))
+                .andExpect(jsonPath("$.stackTrace").doesNotExist());
+    }
+
+    @Test
+    void debeRetornar409CuandoLaVariableAsociadaEstaInactivaAlEditar() throws Exception {
+        when(editarReglaScoringUseCase.editar(eq(7L), any(EditarReglaScoringRequest.class)))
+                .thenThrow(new ReglaScoringVariableInactivaException());
+
+        mockMvc.perform(patch("/api/v1/reglas-scoring/7").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(solicitudEdicionValida())))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("VARIABLE_RIESGO_INACTIVA"));
+    }
+
+    @Test
+    void debeRetornar409CuandoLaEdicionDuplicaOtraReglaExistente() throws Exception {
+        when(editarReglaScoringUseCase.editar(eq(7L), any(EditarReglaScoringRequest.class)))
+                .thenThrow(new ReglaScoringDuplicadaException());
+
+        mockMvc.perform(patch("/api/v1/reglas-scoring/7").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(solicitudEdicionValida())))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("REGLA_SCORING_DUPLICADA"));
+    }
+
+    @Test
+    void debeRetornar400CuandoElIdRegladNoEsNumericoAlEditar() throws Exception {
+        mockMvc.perform(patch("/api/v1/reglas-scoring/abc").with(conRol(JwtConfig.ROL_ADMINISTRADOR))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(objectMapper.writeValueAsString(solicitudEdicionValida())))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+    }
+
+    private EditarReglaScoringRequest solicitudEdicionValida() {
+        return new EditarReglaScoringRequest(OperadorScoring.MENOR, "5000000", 25);
+    }
+
+    private CrearReglaScoringRequest solicitudValida() {
+        return new CrearReglaScoringRequest(1L, OperadorScoring.MAYOR_O_IGUAL, "3000000", 20);
+    }
+}
